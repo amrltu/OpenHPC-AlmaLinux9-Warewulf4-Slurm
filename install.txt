@@ -1,0 +1,207 @@
+dnf install http://repos.openhpc.community/OpenHPC/3/EL_9/x86_64/ohpc-release-3-1.el9.x86_64.rpm
+ 
+ 
+dnf install dnf-plugins-core
+dnf config-manager --set-enabled crb
+
+
+# Install base packages
+dnf -y install ohpc-base
+# Install Warewulf
+dnf -y install warewulf-ohpc hwloc-ohpc
+
+
+
+systemctl enable chronyd.service
+echo "local stratum 10" >> /etc/chrony.conf
+echo "server 0.asia.pool.ntp.org" >> /etc/chrony.conf
+echo "allow all" >> /etc/chrony.conf
+systemctl restart chronyd
+
+
+# Install slurm server meta-package
+dnf -y install ohpc-slurm-server
+# Use ohpc-provided file for starting SLURM configuration
+cp /etc/slurm/slurm.conf.ohpc /etc/slurm/slurm.conf
+# Setup default cgroups file
+cp /etc/slurm/cgroup.conf.example /etc/slurm/cgroup.conf
+# Identify resource manager hostname on master host
+perl -pi -e "s/SlurmctldHost=\S+/SlurmctldHost=amrl/" /etc/slurm/slurm.conf
+
+
+
+# Enable internal interface for provisioning
+ip link set dev eno2 up
+ip address add 192.168.10.1/255.255.255.0 broadcast + dev eno2
+
+
+# Edit the warewulf.conf file to use appropriate interface and settings
+perl -pi -e "s/ipaddr:.*/ipaddr: 192.168.10.1/" /etc/warewulf/warewulf.conf
+perl -pi -e "s/netmask:.*/netmask: 255.255.255.0/" /etc/warewulf/warewulf.conf
+perl -pi -e "s/network:.*/network: 192.168.10.0/" /etc/warewulf/warewulf.conf
+perl -pi -e 's/template:.*/template: static/' /etc/warewulf/warewulf.conf
+sed '/range start:/d;/range end:/d;' -i /etc/warewulf/warewulf.conf
+# Edit the nodes.conf to mount /opt
+perl -pi -e "s/defaults,noauto,nofail,ro/defaults,nofail,ro/" /etc/warewulf/nodes.conf
+
+
+# Create a new "nodes" profile and inherit the "default" profile
+wwctl profile add nodes --profile default --comment "Nodes profile"
+
+# Create a new "nodeconfig" overlay to store node configuration files and use the syncuser overlay.
+wwctl overlay create nodeconfig
+wwctl profile set --yes nodes --system-overlays nodeconfig --runtime-overlays syncuser
+
+# Set default network configuration
+wwctl profile set -y nodes --netname=default --netdev=eno2
+wwctl profile set -y nodes --netname=default --netmask=255.255.255.0
+wwctl profile set -y nodes --netname=default --gateway=192.168.10.1
+#[sms]# wwctl profile set -y nodes --netname=default --nettagadd=DNS=${dns_servers}
+
+#
+
+# Update /etc/hosts template to have ${hostname}.localdomain as the first host entry
+wwctl overlay cat host /etc/hosts.ww | \
+sed -e 's_\({{$node.Id}}{{end}}\)_{{$node.Id}}.localdomain \1_g' | \
+EDITOR=tee wwctl overlay edit host /etc/hosts.ww
+
+
+# Configuring Warewulf will restart/enable relevant services to support provisioning
+systemctl enable --now warewulfd
+wwctl configure --all
+
+##if error on dhcp. Add rang of ip in dhcp.conf
+
+# Generate ssh keys (usually generated on login)
+bash /etc/profile.d/ssh_setup.sh
+
+
+# Import the base image from Warewulf
+wwctl image import docker://ghcr.io/warewulf/warewulf-almalinux:9 almalinux-9 --syncuser
+# Enable OpenHPC inside image and update image. Disable autorebuild.
+wwctl image exec --build=false almalinux-9 /bin/bash <<- EOF
+dnf -y install http://repos.openhpc.community/OpenHPC/3/EL_9/x86_64/ohpc-release-3-1.el9.x86_64.rpm
+dnf -y update
+EOF
+
+
+# Define chroot location
+export CHROOT=$(wwctl image show almalinux-9)
+
+
+
+# Install compute node base meta-package
+wwctl image exec --build=false almalinux-9 /bin/bash <<- EOF
+dnf -y install ohpc-base-compute
+EOF
+
+
+
+wwctl image exec --build=false almalinux-9 /bin/bash <<- EOF
+# Add Slurm client support meta-package and enable munge and slurmd
+dnf -y install ohpc-slurm-client
+systemctl enable munge
+systemctl enable slurmd
+# Add Network Time Protocol (NTP) support
+dnf -y install chrony
+# Include modules user environment
+dnf -y install lmod-ohpc
+EOF
+
+
+# Add NVIDIA GPU driver repository to the SMS
+dnf -y install cuda-repo-ohpc
+# Install the toolkit on the SMS
+dnf -y install nvidia-driver-cuda cuda-devel-ohpc
+# Install on CHROOT
+wwctl image exec --build=false almalinux-9 /bin/bash <<- EOF
+dnf -y install cuda-repo-ohpc
+dnf -y module install nvidia-driver:535-dkms
+KVER=$(rpm -q --queryformat='%{version}-%{release}.%{arch}\n' \
+kernel-core | sort -r | head -1)
+dkms autoinstall --verbose -k \${KVER}
+dkms status
+EOF
+
+wwctl image exec --build=false almalinux-9 /bin/bash <<- EOF
+dnf install elrepo-release
+dnf install nvidia-detect
+EOF
+
+#ban ssh login 
+echo "account required pam_slurm.so" >> $CHROOT/etc/pam.d/sshd
+
+# Configure SMS to receive messages and reload rsyslog configuration
+echo 'module(load="imudp")' >> /etc/rsyslog.d/ohpc.conf
+echo 'input(type="imudp" port="514")' >> /etc/rsyslog.d/ohpc.conf
+systemctl restart rsyslog
+
+echo "*.* action(type=\"omfwd\" Target=\"${sms_ip}\" Port=\"514\" " \
+"Protocol=\"udp\")">> $CHROOT/etc/rsyslog.conf
+# Disable most local logging on computes. Emergency and boot logs will remain on the compute nodes
+perl -pi -e "s/^\*\.info/\\#\*\.info/" $CHROOT/etc/rsyslog.conf
+perl -pi -e "s/^authpriv/\\#authpriv/" $CHROOT/etc/rsyslog.conf
+perl -pi -e "s/^mail/\\#mail/" $CHROOT/etc/rsyslog.conf
+perl -pi -e "s/^cron/\\#cron/" $CHROOT/etc/rsyslog.conf
+perl -pi -e "s/^uucp/\\#uucp/" $CHROOT/etc/rsyslog.conf
+
+
+# Install ClusterShell
+dnf -y install clustershell
+# Setup node definitions
+cd /etc/clustershell/groups.d
+mv local.cfg local.cfg.orig
+echo "adm: amrl" > local.cfg
+echo "compute: c1" >> local.cfg
+echo "all: @adm,@compute" >> local.cfg
+
+# Add the following to support unprivileged user namespaces for tools like Apptainer
+wwctl overlay import --parents nodeconfig /etc/subuid
+wwctl overlay import --parents nodeconfig /etc/subgid
+
+
+# Identify master host as local NTP server, configure it with a template with a Tag
+echo 'server {{.Tags.ntpserver}} iburst' | \
+wwctl overlay import --parents nodeconfig <(cat) /etc/chrony.conf.ww
+wwctl profile set --yes nodes --tagadd ntpserver=192.168.10.1
+
+# Configure systemd and NetworkManger to wait for the network to be fully up.
+cat <<- EOF | wwctl overlay import --parents nodeconfig <(cat) \
+/etc/systemd/system/NetworkManager-wait-online.service.d/override.conf
+[Service]
+ExecStart=
+ExecStart=/usr/bin/nm-online -q
+EOF
+
+# Configure Slurm server in the overlay (using "configless" option) using a tag in a template file (slurmd.ww)
+echo SLURMD_OPTIONS='--conf-server {{.Tags.slurmctld}}' | \
+wwctl overlay import --parents nodeconfig <(cat) /etc/sysconfig/slurmd.ww
+
+# Set the value of the slurmctld tag to the $sms_ip for the nodes profile.
+wwctl profile set --yes nodes --tagadd slurmctld=192.168.10.1
+
+# Configure munge
+wwctl overlay import --parents nodeconfig /etc/munge/munge.key
+wwctl overlay chown nodeconfig /etc/munge/munge.key $(id -u munge) $(id -g munge)
+wwctl overlay chown nodeconfig /etc/munge $(id -u munge) $(id -g munge)
+wwctl overlay chmod nodeconfig /etc/munge 0700
+
+# Build image
+wwctl image build almalinux-9
+wwctl overlay build
+
+
+wwctl node add --image=almalinux-9 --profile=nodes --netname=default \
+--ipaddr=192.168.10.101 --hwaddr=ac:1f:6b:d2:2b:d4 c1
+
+
+# build the overlays for all the nodes
+wwctl overlay build
+
+# Update Warewulf configure
+wwctl configure --all
+
+
+# Enable and start munge and slurmctld
+systemctl enable --now munge
+systemctl enable --now slurmctld
