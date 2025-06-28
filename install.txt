@@ -58,7 +58,6 @@ wwctl profile set -y nodes --netname=default --netmask=255.255.255.0
 wwctl profile set -y nodes --netname=default --gateway=192.168.10.1
 #[sms]# wwctl profile set -y nodes --netname=default --nettagadd=DNS=${dns_servers}
 
-#
 
 # Update /etc/hosts template to have ${hostname}.localdomain as the first host entry
 wwctl overlay cat host /etc/hosts.ww | \
@@ -70,7 +69,6 @@ EDITOR=tee wwctl overlay edit host /etc/hosts.ww
 systemctl enable --now warewulfd
 wwctl configure --all
 
-##if error on dhcp. Add rang of ip in dhcp.conf
 
 # Generate ssh keys (usually generated on login)
 bash /etc/profile.d/ssh_setup.sh
@@ -110,23 +108,27 @@ EOF
 
 
 # Add NVIDIA GPU driver repository to the SMS
-dnf -y install cuda-repo-ohpc
-# Install the toolkit on the SMS
-dnf -y install nvidia-driver-cuda cuda-devel-ohpc
-# Install on CHROOT
-wwctl image exec --build=false almalinux-9 /bin/bash <<- EOF
-dnf -y install cuda-repo-ohpc
-dnf -y module install nvidia-driver:535-dkms
-KVER=$(rpm -q --queryformat='%{version}-%{release}.%{arch}\n' \
-kernel-core | sort -r | head -1)
-dkms autoinstall --verbose -k \${KVER}
-dkms status
-EOF
+
+#wwctl image exec --build=false almalinux-9 /bin/bash <<- EOF
+#dnf install elrepo-release
+#dnf install nvidia-detect
+#EOF
+
 
 wwctl image exec --build=false almalinux-9 /bin/bash <<- EOF
-dnf install elrepo-release
-dnf install nvidia-detect
+echo "blacklist nouveau" > /etc/modprobe.d/blacklist-nouveau.conf
+echo "options nouveau modeset=0" >> /etc/modprobe.d/blacklist-nouveau.conf
+dnf -y install cuda-repo-ohpc
+dnf -y install nvidia-driver-assistant # this can be checked if it can have latest driver supported.
+dnf groupinstall "Development Tools" -y
+dnf install kernel-devel-$(uname -r) kernel-headers-$(uname -r) gcc make dkms elfutils-libelf-devel libglvnd-devel -y
+dnf install epel-release -y
+dnf install freeglut-devel libX11-devel libXi-devel libXmu-devel mesa-libGLU-devel freeimage-devel libglfw3-devel -y
 EOF
+
+
+#Offline Driver for RTX 4000 nvidia-Linux-x86_64-.550.163.1
+wget https://us.download.nvidia.com/XFree86/Linux-x86_64/550.163.01/NVIDIA-Linux-x86_64-550.163.01.run
 
 #ban ssh login 
 echo "account required pam_slurm.so" >> $CHROOT/etc/pam.d/sshd
@@ -205,3 +207,28 @@ wwctl configure --all
 # Enable and start munge and slurmctld
 systemctl enable --now munge
 systemctl enable --now slurmctld
+
+##NVIDIA DRIVER
+#Run the below command to verify if Nouveau is loaded:
+lsmod | grep nouveau
+
+#install Run File to install nvidia driver from host to compute node manually
+#Donot rebuild initfimas
+
+
+# Development Tools
+dnf -y install ohpc-autotools
+dnf -y install EasyBuild-ohpc
+dnf -y install hwloc-ohpc
+dnf -y install spack-ohpc
+dnf -y install valgrind-ohpc
+
+
+
+dnf -y install gnu14-compilers-ohpc
+
+dnf -y install openmpi5-pmix-gnu14-ohpc mpich-ofi-gnu14-ohpc
+
+ dnf -y install ohpc-gnu14-perf-tools
+ 
+ dnf -y install lmod-defaults-gnu14-openmpi5-ohpc
